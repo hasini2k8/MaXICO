@@ -1,238 +1,326 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import os
 import json
-import uuid
-from datetime import datetime
+import time
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import google.generativeai as genai
-from dotenv import load_dotenv
-
-
-# Load environment variables
-load_dotenv()
+from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)
 
+# Configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'webm', 'mp4', 'avi', 'mov'}
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+# Create uploads folder if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Configure Gemini API
+# Make sure to set your API key as an environment variable
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY not found in environment variables!")
+    print("Set it with: export GEMINI_API_KEY='your-api-key-here'")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# System prompt for Gemini
+SYSTEM_PROMPT = """You are an AI assistant that analyzes a video of a user throwing trash. Your task is to determine if the trash was successfully thrown into the garbage bin. If yes, return "yes"; if not, return "no". Also, classify the trash as one of: "compost", "recyclable", or "trash". Only return the output in JSON format: { "thrown_in_bin": "yes" | "no", "trash_type": "compost" | "recyclable" | "trash" }. Use visual cues from the video to decide if the trash lands in the bin, and classify common household waste correctly. Do not include any extra commentary."""
 
 
-# Configure Gemini
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-model = genai.GenerativeModel('gemini-pro')
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# In-memory storage (use a database in production)
-transcriptions = []
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "OK", "timestamp": datetime.now().isoformat()})
-
-@app.route('/api/transcriptions', methods=['POST'])
-def create_transcription():
+def analyze_video_with_gemini(video_path):
+    """
+    Analyze video using Gemini API
+    Returns parsed JSON response
+    """
     try:
-        data = request.get_json()
+        print(f"Starting video analysis for: {video_path}")
         
-        if not data or 'text' not in data:
-            return jsonify({"error": "Text is required"}), 400
+        # Initialize Gemini model with the correct format
+        # Use the full model path that works with video
+        model = genai.GenerativeModel('models/gemini-2.0-flash')
+        print(f"Using model: gemini-2.0-flash")
         
-        # Create transcription record
-        transcription = {
-            "id": str(uuid.uuid4()),
-            "text": data['text'],
-            "metadata": {
-                "duration": data.get('duration', 0),
-                "language": data.get('language', 'en-US'),
-                "created_at": datetime.now().isoformat()
-            }
-        }
+        # Upload file using the correct API
+        print("Uploading video to Gemini...")
+        video_file = genai.upload_file(path=video_path)
+        print(f"Upload complete. File name: {video_file.name}")
         
-        # Analyze with Gemini
-        analysis = analyze_with_gemini(data['text'])
-        transcription['analysis'] = analysis
+        # Wait for file to be processed
+        print("Waiting for video processing...")
+        while video_file.state.name == "PROCESSING":
+            print("  Still processing...")
+            time.sleep(5)
+            video_file = genai.get_file(video_file.name)
         
-        # Store transcription
-        transcriptions.append(transcription)
+        if video_file.state.name == "FAILED":
+            raise Exception("Video processing failed on Gemini servers")
         
-        return jsonify({
-            "success": True,
-            "data": transcription
-        }), 201
+        print("Video processed successfully. Generating analysis...")
         
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/transcriptions', methods=['GET'])
-def get_transcriptions():
-    try:
-        # Get pagination parameters
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 10))
+        # Generate content with video and prompt
+        response = model.generate_content(
+            [video_file, SYSTEM_PROMPT],
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.1,
+            )
+        )
         
-        # Calculate pagination
-        start = (page - 1) * limit
-        end = start + limit
+        # Get response text
+        response_text = response.text.strip()
+        print(f"Raw Gemini response:\n{response_text}\n")
         
-        paginated_transcriptions = transcriptions[start:end]
+        # Clean up response text (remove markdown if present)
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
         
-        return jsonify({
-            "success": True,
-            "data": paginated_transcriptions,
-            "pagination": {
-                "page": page,
-                "limit": limit,
-                "total": len(transcriptions),
-                "pages": (len(transcriptions) + limit - 1) // limit
-            }
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/transcriptions/<transcription_id>', methods=['GET'])
-def get_transcription(transcription_id):
-    try:
-        transcription = next((t for t in transcriptions if t['id'] == transcription_id), None)
-        
-        if not transcription:
-            return jsonify({"error": "Transcription not found"}), 404
-        
-        return jsonify({
-            "success": True,
-            "data": transcription
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/transcriptions/<transcription_id>', methods=['DELETE'])
-def delete_transcription(transcription_id):
-    try:
-        global transcriptions
-        original_length = len(transcriptions)
-        transcriptions = [t for t in transcriptions if t['id'] != transcription_id]
-        
-        if len(transcriptions) == original_length:
-            return jsonify({"error": "Transcription not found"}), 404
-        
-        return jsonify({
-            "success": True,
-            "message": "Transcription deleted successfully"
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/analyze', methods=['POST'])
-def analyze_text():
-    try:
-        data = request.get_json()
-        
-        if not data or 'text' not in data:
-            return jsonify({"error": "Text is required"}), 400
-        
-        analysis = analyze_with_gemini(data['text'])
-        
-        return jsonify({
-            "success": True,
-            "analysis": analysis
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/summarize', methods=['POST'])
-def summarize_text():
-    try:
-        data = request.get_json()
-        
-        if not data or 'text' not in data:
-            return jsonify({"error": "Text is required"}), 400
-        
-        summary = summarize_with_gemini(data['text'])
-        
-        return jsonify({
-            "success": True,
-            "summary": summary
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-def analyze_with_gemini(text):
-    """Analyze transcript with Gemini AI"""
-    try:
-        prompt = f"""
-        Analyze the following meeting transcript and provide insights:
-
-        Transcript: "{text}"
-
-        Please provide:
-        1. Key topics discussed
-        2. Action items or decisions made
-        3. Important participants mentioned
-        4. Overall sentiment
-        5. Brief summary
-
-        Format your response as JSON with the following structure:
-        {{
-            "topics": ["topic1", "topic2", ...],
-            "action_items": ["item1", "item2", ...],
-            "participants": ["person1", "person2", ...],
-            "sentiment": "positive/negative/neutral",
-            "summary": "brief summary of the meeting"
-        }}
-        """
-        
-        response = model.generate_content(prompt)
-        
-        # Try to parse as JSON, fallback to text if it fails
+        # Parse JSON response
         try:
-            analysis = json.loads(response.text)
+            result = json.loads(response_text)
         except json.JSONDecodeError:
-            analysis = {
-                "raw_analysis": response.text,
-                "topics": [],
-                "action_items": [],
-                "participants": [],
-                "sentiment": "neutral",
-                "summary": response.text[:200] + "..." if len(response.text) > 200 else response.text
+            # If direct parsing fails, try to find JSON in the text
+            import re
+            json_match = re.search(r'\{[^}]+\}', response_text)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                raise ValueError(f"Could not parse JSON from response: {response_text}")
+        
+        # Validate response structure
+        if "thrown_in_bin" not in result or "trash_type" not in result:
+            print(f"Warning: Invalid response structure: {result}")
+            # Provide default structure
+            result = {
+                "thrown_in_bin": result.get("thrown_in_bin", "no"),
+                "trash_type": result.get("trash_type", "trash"),
+                "raw_response": response_text
             }
         
-        return analysis
+        print(f"Parsed result: {result}")
+        
+        # Clean up uploaded file
+        try:
+            genai.delete_file(video_file.name)
+            print("Cleaned up temporary file from Gemini")
+        except Exception as cleanup_error:
+            print(f"Warning: Could not cleanup file: {cleanup_error}")
+        
+        return result
         
     except Exception as e:
+        print(f"ERROR in analyze_video_with_gemini: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
-            "error": f"Analysis failed: {str(e)}",
-            "topics": [],
-            "action_items": [],
-            "participants": [],
-            "sentiment": "neutral",
-            "summary": "Analysis unavailable"
+            "error": str(e),
+            "error_type": type(e).__name__
         }
 
-def summarize_with_gemini(text):
-    """Summarize transcript with Gemini AI"""
+
+def analyze_video_alternative(video_path):
+    """
+    Alternative method using direct file upload
+    """
     try:
-        prompt = f"""
-        Please provide a concise summary of this meeting transcript:
-
-        "{text}"
-
-        Focus on:
-        - Main discussion points
-        - Key decisions made
-        - Next steps or action items
+        import google.generativeai.types.file_types as file_types
         
-        Keep the summary under 200 words.
-        """
+        model = genai.GenerativeModel('gemini-2.0-flash')
         
-        response = model.generate_content(prompt)
-        return response.text
+        print(f"Using alternative upload method for: {video_path}")
+        
+        # Try using the Files API directly
+        file = genai.File.create(
+            path=video_path,
+            display_name=os.path.basename(video_path)
+        )
+        
+        print(f"File uploaded with URI: {file.uri}")
+        
+        # Wait for processing
+        while file.state.name == "PROCESSING":
+            print("Processing video...")
+            time.sleep(3)
+            file = genai.File.get(file.name)
+        
+        if file.state.name == "FAILED":
+            raise Exception("Video processing failed")
+        
+        # Generate content
+        response = model.generate_content([SYSTEM_PROMPT, file])
+        
+        response_text = response.text.strip()
+        print(f"Raw response: {response_text}")
+        
+        # Parse JSON
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+        
+        result = json.loads(response_text)
+        
+        # Cleanup
+        try:
+            file.delete()
+        except:
+            pass
+        
+        return result
         
     except Exception as e:
-        return f"Summary unavailable: {str(e)}"
+        print(f"Alternative method also failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"All upload methods failed: {str(e)}"}
+
+
+@app.route('/api/upload', methods=['POST'])
+def upload_video():
+    """
+    Handle video upload and analysis
+    """
+    try:
+        # Check if video file is present
+        if 'video' not in request.files:
+            return jsonify({'error': 'No video file provided'}), 400
+        
+        video = request.files['video']
+        
+        if video.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(video.filename):
+            return jsonify({'error': 'Invalid file type'}), 400
+        
+        # Save the video file
+        filename = secure_filename(video.filename)
+        timestamp = int(time.time())
+        filename = f"{timestamp}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        video.save(filepath)
+        
+        print(f"Video saved to: {filepath}")
+        
+        # Get summary from frontend (optional metadata)
+        summary_data = request.form.get('summary')
+        if summary_data:
+            summary = json.loads(summary_data)
+            print(f"Frontend summary: {summary}")
+        
+        # Analyze video with Gemini
+        gemini_result = analyze_video_with_gemini(filepath)
+        
+        # Return combined response
+        response = {
+            'success': True,
+            'filename': filename,
+            'gemini_analysis': gemini_result,
+            'message': 'Video uploaded and analyzed successfully'
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"Upload error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analyze-existing', methods=['POST'])
+def analyze_existing_video():
+    """
+    Analyze an existing video in the uploads folder
+    """
+    try:
+        data = request.get_json()
+        filename = data.get('filename')
+        
+        if not filename:
+            return jsonify({'error': 'No filename provided'}), 400
+        
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'File not found'}), 404
+        
+        # Analyze video with Gemini
+        gemini_result = analyze_video_with_gemini(filepath)
+        
+        response = {
+            'success': True,
+            'filename': filename,
+            'gemini_analysis': gemini_result
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"Analysis error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/list-videos', methods=['GET'])
+def list_videos():
+    """
+    List all videos in the uploads folder
+    """
+    try:
+        files = []
+        for filename in os.listdir(app.config['UPLOAD_FOLDER']):
+            if allowed_file(filename):
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                files.append({
+                    'filename': filename,
+                    'size': os.path.getsize(filepath),
+                    'created': os.path.getctime(filepath)
+                })
+        
+        return jsonify({'files': files}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """
+    Health check endpoint
+    """
+    gemini_configured = GEMINI_API_KEY is not None
+    return jsonify({
+        'status': 'ok',
+        'gemini_configured': gemini_configured,
+        'upload_folder': app.config['UPLOAD_FOLDER']
+    }), 200
+
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 3000))
-    debug = os.getenv('FLASK_ENV') == 'development'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    print("="*50)
+    print("Flask Backend with Gemini API Integration")
+    print("="*50)
+    print(f"Upload folder: {UPLOAD_FOLDER}")
+    print(f"Gemini API configured: {GEMINI_API_KEY is not None}")
+    
+    # List available models
+    if GEMINI_API_KEY:
+        try:
+            print("\nAvailable Gemini models:")
+            for model in genai.list_models():
+                if 'generateContent' in model.supported_generation_methods:
+                    print(f"  - {model.name}")
+        except Exception as e:
+            print(f"Could not list models: {e}")
+    
+    print("="*50)
+    app.run(debug=True, port=5000)

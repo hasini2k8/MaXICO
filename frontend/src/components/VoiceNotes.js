@@ -40,10 +40,27 @@ export default function TrashRecorder() {
   };
 
   const labelToCategory = (label) => {
-    const l = label.toLowerCase();
+    const l = label.toLowerCase().trim();
+    
+    // Exclude people/humans - check this FIRST
+    if (l.includes("person") || l.includes("people") || l.includes("human") || l.includes("man") || l.includes("woman") || l.includes("child")) {
+      return "person";
+    }
+    
+    // Check exact matches in categoryMap
     if (categoryMap[l]) return categoryMap[l];
-    if (l.includes("bottle") || l.includes("cup") || l.includes("can") || l.includes("glass")) return "Recyclable";
-    if (["banana", "apple", "orange", "sandwich", "hotdog"].some(x => l.includes(x))) return "Compost";
+    
+    // Check recyclables
+    if (l.includes("bottle") || l.includes("cup") || l.includes("can") || l.includes("glass")) {
+      return "Recyclable";
+    }
+    
+    // Check compost
+    if (["banana", "apple", "orange", "sandwich", "hotdog"].some(x => l.includes(x))) {
+      return "Compost";
+    }
+    
+    // Default to Trash
     return "Trash";
   };
 
